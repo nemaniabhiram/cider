@@ -1,107 +1,105 @@
-# Distributed Key-Value Cache — System Design
+## 1. Raft in a Nutshell
 
-This document explains how the cache service works. It shows the main parts, the data flow, and how the nodes stay in sync.
+Raft is a _consensus_ protocol.  It lets a cluster of unreliable machines act as **one** reliable state machine.  The core ideas are:
 
----
+1. **Leader election** – at any moment one node is the leader; all others are followers.  
+2. **Log replication** – every change is a log entry that must reach a majority before it is _committed_.  
+3. **State machine safety** – once an entry is committed, every correct node will eventually apply it in the same order.
 
-## 1. High-Level View
+A node moves through three states:
 
-![HighLevelView](assets/highLevelView.png)
+| State      | When it is active                                |
+| ---------- | ------------------------------------------------ |
+| **Follower**  | Normal, quiet state; responds to leaders and candidates |
+| **Candidate** | Starts an election when it times-out without hearing a leader |
+| **Leader**    | Handles client commands and replicates log entries |
 
-* The **TCP server** listens on port 8080 and speaks a simple text protocol.
-* Each user owns a **store** object that holds the password and its cache.
-* The **cache** is a thread-safe map guarded by read–write locks.
-* A **Raft cluster** keeps many nodes consistent. Each node runs a `RaftNode` instance.
+### 1.1 State&nbsp;Machine at a Glance
+A follower can time-out, become a candidate, and—if it gains a majority—upgrade to leader. Any node that sees a higher term steps back to follower.
 
----
+![State Transition](assets/stateTransitionDiagram.png)
 
-## 2. Component Details
+### 1.2 Leader Election
+When a follower’s election timer fires it starts an election by sending `RequestVote` RPCs. If it gathers votes from a majority, it begins its reign as leader.
 
-### 2.1 TCP Server
+![Leader Election Sequence](assets/leaderElectionSequence.png)
 
-* Opens a listener and accepts many connections.
-* Handles `LOGIN` and `SIGNUP` before any cache command.
-* Parses `GET`, `SET`, `HAS`, and `DELETE` lines and forwards them to the right store.
+### 1.3 Log Replication
+The leader packages client commands into log entries and floods them to followers using `AppendEntries` messages. Once an entry sits on > 50 % of the nodes it is **committed** and applied.
 
-### 2.2 User Store
-
-* Binds a user name, a password, and a cache.
-* Verifies the password on every login.
-
-### 2.3 In-Memory Cache
-
-* Uses a `map[string]string` plus a `sync.RWMutex`.
-* Exposes `Set`, `Get`, `Has`, and `Delete` methods.
-* Calls return quickly because all data lives in memory.
-
-### 2.4 Raft Layer
-
-* Elects one leader at a time with randomized timeouts.
-* The leader ships log entries to followers on a heartbeat.
-* Log entries hold cache commands, ensuring every node applies them in order.
+![Log Replication Happy Path](assets/logReplication.png)
 
 ---
 
-## 3. Read Path
+## 2. Source Walkthrough
+The Raft code lives in [`cider/raft`](./raft/).  Each file matches one concept in the protocol.
 
-![ReadPath](assets/readPath.png)
+| File           | What it holds                                                                            |
+| -------------- | ---------------------------------------------------------------------------------------- |
+| `types.go`     | Node state (`Follower`, `Candidate`, `Leader`), in-memory log, and the `RaftNode` struct |
+| `rpc.go`       | RPC argument / reply structs and server methods (`RequestVote`, `AppendEntries`)         |
+| `node.go`      | The control logic: time-outs, elections, heart-beats, and log replication                |
 
-The server never waits on the cluster for reads because every node keeps a local copy after replication.
+Below is a step-by-step map from the Raft paper to the Cider code.
+
+### 2.1 Starting a Node – `NewRaftNode`
+```go
+node := &RaftNode{
+    State: Follower,
+    Log:   []LogEntry{{Term: 0}}, // genesis entry
+}
+```
+*Every node begins life as a follower with an empty (genesis) log.*
+
+### 2.2 Leader Election – `startElection` (node.go)
+1. Promote self to **Candidate**.  
+2. Increment `CurrentTerm` and vote for self.  
+3. Send `RequestVote` RPC to every peer.  
+4. On majority → become **Leader** and start the heart-beat ticker.
+
+Corresponding code:
+```go
+n.State = Candidate
+n.CurrentTerm++
+// ... send RPCs
+if votes > len(n.Peers)/2 {
+    n.State = Leader
+    n.StartHeartbeat()
+}
+```
+
+### 2.3 Heart-Beats & Log Replication – `sendHeartbeat`
+* Called every 100 ms by the leader.  
+* Wraps new log entries into an `AppendEntriesArgs` (the _heart-beat_ doubles as a replication message).  
+* Retries until every follower catches up.
+
+### 2.4 Safety Checks – `RequestVote` & `AppendEntries` (rpc.go)
+Both server methods begin with **term comparisons**:
+```go
+if args.Term < n.CurrentTerm { reject }
+if args.Term > n.CurrentTerm { step-down }
+```
+These protect the cluster from stale leaders.
+
+### 2.5 Commit Index Advancement – inside `sendHeartbeat`
+After every successful replication the leader updates `MatchIndex[peer]`.  
+When a log index is stored on a **majority**, it bumps `CommitIndex`, which in turn lets the application layer apply the entry.
 
 ---
 
-## 4. Write Path
-
-![ReadPath](assets/writePath.png)
-
-A write is successful only after a majority of nodes store the entry. This guarantees durability under node loss.
-
-## 5. Raft Consensus Walkthrough
-
-![ReadPath](assets/raft.png)
-
-* A node that times out becomes **Candidate** and requests votes.
-* Majority votes make it **Leader**; it issues heartbeats to keep control.
-* Writes travel inside **AppendEntries**; followers store and confirm.
-* Once a majority stores an entry, the leader marks it committed and informs others in the next heartbeat.
-
----
-
-## 6. Failure Handling
-
-* A crashed follower replays the leader log on restart.
-* If the leader fails, a new election starts after a timeout. The node with the freshest log wins.
-* Clients can reconnect to any node; each node forwards writes to the current leader.
-
----
-
-## 7. Build and Run
-
+## 3. How to Run a Local Cluster
 ```bash
-# Build
-cd cider
-go mod tidy
-go run ./main.go
+# In three separate terminals
+ADDR=:9001 go run main.go
+ADDR=:9002 go run main.go
+ADDR=:9003 go run main.go
 ```
+Each instance reads the `PEERS` env-var (comma-separated `host:port`) to discover the rest.  _Example_: `PEERS=localhost:9001,localhost:9002,localhost:9003`.
 
-The server now listens on `localhost:8080`.
+Use `curl` or `nc` to send commands to the **leader**; followers will forward them automatically.
 
 ---
 
-## 8. Example Session
-
-```text
-$ nc localhost 8080
-LOGIN or SIGNUP
-SIGNUP
-Enter username: alice
-Enter password: secret
-User created successfully
-SET foo bar
-OK
-GET foo
-bar
-```
-
----
-
+## 4. Further Reading
+* The original Raft paper – _“In Search of an Understandable Consensus Algorithm”_.  
+* The free Raft visualisation at <https://raft.github.io/raftscope/>.
